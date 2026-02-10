@@ -302,7 +302,6 @@ Output:
 
 A "Diamond" graph (skip connection) where an intermediate (`Tensor1`) is needed by two downstream branches. `Op2` needs both `Tensor1` and `Tensor2` to start.
 
-````
 ```mermaid
 graph LR
     Tensor0(("Tensor[0]<br>128x128"))
@@ -321,7 +320,6 @@ graph LR
     Tensor2 --> Op2
     Op2 --> Tensor3
 ```
-````
 
 Input:
 
@@ -434,7 +432,6 @@ Output:
 This example demonstrates how execution order impacts bandwidth. For MatMul, processing tiles in a "zig-zag" order allows us to keep data resident in the fast   
 memory, avoiding expensive re-loads ("Revisits").
 
-````
 ```mermaid
 graph LR
     Tensor0(("Tensor[0]<br>128x128"))
@@ -446,7 +443,6 @@ graph LR
     Tensor1 --> Op0
     Op0 --> Tensor2
 ```
-````
 
 Input
 
@@ -574,7 +570,6 @@ The `128x128` output is divided into 4 chunks.
 
 This example demonstrates advanced subgraph grouping for chained MatMuls (`(A @ B) @ C`). It shows how manipulating the `k` dimension controls the size of the intermediate tensor in fast memory.
 
-````json
 ```mermaid
 graph LR
     Tensor0(("Tensor[0]<br>128x128"))
@@ -592,7 +587,6 @@ graph LR
     Tensor2 --> Op1
     Op1 --> Tensor4
 ```
-````
 
 * Scenario**:** We calculate `(Tensor0 @ Tensor1) @ Tensor2`.   
 * Constraint**:** The fast memory capacity (45,000) is tight. It cannot hold three full `128x128` tensors (16,384 each) simultaneously.
