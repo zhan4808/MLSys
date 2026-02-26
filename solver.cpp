@@ -409,6 +409,8 @@ struct Subgraph {
     Gran gran;
     double latency;
     bool active = true;
+    vector<int> retain;      // tensors to keep in fast mem for next SG
+    vector<int> traversal;   // tile traversal order (empty = raster/null)
 };
 
 // Check if merging sg_a into sg_b would create a cycle in the subgraph DAG
@@ -482,7 +484,7 @@ vector<Subgraph> greedy_fusion(const Problem& p) {
         sgs[i].latency = lat;
     }
 
-    // Iteratively merge best adjacent pair
+    // Phase 1: merge pairs with positive latency benefit
     bool changed = true;
     while (changed) {
         changed = false;
@@ -496,12 +498,11 @@ vector<Subgraph> greedy_fusion(const Problem& p) {
         for (auto [sa, sb] : pairs) {
             if (creates_cycle(sa, sb, sgs, op_to_sg, p)) continue;
 
-            // Try merging
             vector<int> merged_ops = sgs[sa].ops;
             merged_ops.insert(merged_ops.end(), sgs[sb].ops.begin(), sgs[sb].ops.end());
 
             auto [g, lat] = find_best_gran(p, merged_ops);
-            if (g.w == 0) continue;  // doesn't fit in memory
+            if (g.w == 0) continue;
 
             double benefit = (sgs[sa].latency + sgs[sb].latency) - lat;
             if (benefit > best_benefit) {
@@ -514,7 +515,52 @@ vector<Subgraph> greedy_fusion(const Problem& p) {
         }
 
         if (best_a >= 0 && best_benefit > 0) {
-            // Execute merge: absorb best_b into best_a
+            for (int oi : sgs[best_b].ops) {
+                sgs[best_a].ops.push_back(oi);
+                op_to_sg[oi] = best_a;
+            }
+            sgs[best_a].gran = best_gran;
+            sgs[best_a].latency = best_lat;
+            sgs[best_b].active = false;
+            sgs[best_b].ops.clear();
+            changed = true;
+        }
+    }
+
+    // Phase 2: merge pairs with zero latency cost that create ephemeral tensors
+    changed = true;
+    while (changed) {
+        changed = false;
+        auto pairs = adjacent_pairs(sgs, op_to_sg, p);
+
+        int best_a = -1, best_b = -1;
+        int best_ephem = 0;
+        Gran best_gran{};
+        double best_lat = 0;
+
+        for (auto [sa, sb] : pairs) {
+            if (creates_cycle(sa, sb, sgs, op_to_sg, p)) continue;
+
+            vector<int> merged_ops = sgs[sa].ops;
+            merged_ops.insert(merged_ops.end(), sgs[sb].ops.begin(), sgs[sb].ops.end());
+
+            auto [g, lat] = find_best_gran(p, merged_ops);
+            if (g.w == 0) continue;
+
+            double benefit = (sgs[sa].latency + sgs[sb].latency) - lat;
+            if (benefit < -1e-6) continue;  // don't merge if it increases latency
+
+            int n_ephem = (int)analyze(p, merged_ops).ephem.size();
+            if (n_ephem > best_ephem) {
+                best_ephem = n_ephem;
+                best_a = sa;
+                best_b = sb;
+                best_gran = g;
+                best_lat = lat;
+            }
+        }
+
+        if (best_a >= 0 && best_ephem > 0) {
             for (int oi : sgs[best_b].ops) {
                 sgs[best_a].ops.push_back(oi);
                 op_to_sg[oi] = best_a;
@@ -576,6 +622,162 @@ vector<int> topo_sort_subgraphs(const vector<Subgraph>& sgs, const Problem& p) {
 }
 
 // ============================================================
+// Zig-zag traversal & retention
+// ============================================================
+
+vector<int> gen_zigzag(int64_t tiles_x, int64_t tiles_y) {
+    vector<int> order;
+    for (int64_t ty = 0; ty < tiles_y; ty++) {
+        if (ty % 2 == 0)
+            for (int64_t tx = 0; tx < tiles_x; tx++)
+                order.push_back((int)(ty * tiles_x + tx));
+        else
+            for (int64_t tx = tiles_x - 1; tx >= 0; tx--)
+                order.push_back((int)(ty * tiles_x + tx));
+    }
+    return order;
+}
+
+bool has_matmul(const Problem& p, const vector<int>& ops) {
+    for (int oi : ops)
+        if (p.ops[oi].type == "MatMul") return true;
+    return false;
+}
+
+// 0=other, 1=LHS only, 2=RHS only, 3=both
+int matmul_role(const Problem& p, int tidx, const vector<int>& ops) {
+    int role = 0;
+    for (int oi : ops) {
+        const Op& op = p.ops[oi];
+        if (op.type == "MatMul") {
+            if (!op.ins.empty() && op.ins[0] == tidx) role |= 1;
+            if (op.ins.size() > 1 && op.ins[1] == tidx) role |= 2;
+        }
+    }
+    return role;
+}
+
+// Latency with zig-zag reuse and retention
+double calc_latency_final(const Problem& p, const vector<int>& ops,
+                          const SGInfo& info, const Gran& g,
+                          bool zigzag,
+                          const set<int>& retained_in,
+                          const set<int>& retained_out) {
+    if (info.out_W <= 0 || info.out_H <= 0) return 0;
+
+    int64_t tiles_x = (info.out_W + g.w - 1) / g.w;
+    int64_t tiles_y = (info.out_H + g.h - 1) / g.h;
+    int64_t nat_scale = max(1LL, (g.w + p.nat_w - 1) / p.nat_w) *
+                        max(1LL, (g.h + p.nat_h - 1) / p.nat_h);
+
+    double compute = 0;
+    for (int oi : ops) compute += (double)p.ops[oi].base_cost;
+    compute *= nat_scale;
+
+    // mem_out: exclude retained outputs
+    double mem_out = 0;
+    for (int t : info.out_bd)
+        if (!retained_out.count(t))
+            mem_out += (double)(g.w * g.h) / p.slow_bw;
+
+    // Classify boundary inputs
+    struct TIC { double mem; int role; };  // role: 1=LHS, 2=RHS, 0=other
+    vector<TIC> inputs;
+    for (int t : info.in_bd) {
+        if (retained_in.count(t)) continue;  // free
+        int r = matmul_role(p, t, ops);
+        double mem = (double)tile_mem_in(p, t, ops, g) / p.slow_bw;
+        int rc = (r == 1) ? 1 : (r == 2) ? 2 : 0;
+        inputs.push_back({mem, rc});
+    }
+
+    // Single tile or no zig-zag: simple model
+    if (!zigzag || (tiles_x <= 1 && tiles_y <= 1)) {
+        double mem_in = 0;
+        for (auto& tic : inputs) mem_in += tic.mem;
+        return tiles_x * tiles_y * max(compute, mem_in + mem_out);
+    }
+
+    // Per-tile with zig-zag reuse
+    double total = 0;
+    int64_t prev_tx = -1, prev_ty = -1;
+    for (int64_t ty = 0; ty < tiles_y; ty++) {
+        bool ltr = (ty % 2 == 0);
+        for (int64_t i = 0; i < tiles_x; i++) {
+            int64_t tx = ltr ? i : (tiles_x - 1 - i);
+            double mem_in = 0;
+            for (auto& tic : inputs) {
+                bool reuse = false;
+                if (prev_tx >= 0) {
+                    if (tic.role == 1 && ty == prev_ty) reuse = true;  // LHS, same row
+                    if (tic.role == 2 && tx == prev_tx) reuse = true;  // RHS, same col
+                }
+                if (!reuse) mem_in += tic.mem;
+            }
+            total += max(compute, mem_in + mem_out);
+            prev_tx = tx;
+            prev_ty = ty;
+        }
+    }
+    return total;
+}
+
+void assign_traversals(vector<Subgraph>& sgs, const Problem& p) {
+    for (auto& sg : sgs) {
+        if (!has_matmul(p, sg.ops)) continue;
+        SGInfo info = analyze(p, sg.ops);
+        int64_t tiles_x = (info.out_W + sg.gran.w - 1) / sg.gran.w;
+        int64_t tiles_y = (info.out_H + sg.gran.h - 1) / sg.gran.h;
+        if (tiles_x * tiles_y > 1)
+            sg.traversal = gen_zigzag(tiles_x, tiles_y);
+    }
+}
+
+void assign_retention(vector<Subgraph>& sgs, const vector<int>& order, const Problem& p) {
+    int ns = (int)order.size();
+    for (int idx = 0; idx + 1 < ns; idx++) {
+        auto& sg_cur = sgs[order[idx]];
+        auto& sg_next = sgs[order[idx + 1]];
+        SGInfo info_cur = analyze(p, sg_cur.ops);
+        SGInfo info_next = analyze(p, sg_next.ops);
+
+        // Candidates: tensors produced by cur and consumed by next
+        vector<pair<int, double>> cands;
+        for (int t : info_cur.out_bd) {
+            if (!info_next.in_bd.count(t)) continue;
+            int64_t T_full = p.tensors[t].w * p.tensors[t].h;
+            int64_t extra_prod = T_full - sg_cur.gran.w * sg_cur.gran.h;
+            int64_t extra_cons = T_full - input_slice(p, t, sg_next.ops, sg_next.gran);
+            // Quick feasibility
+            int64_t ws_cur = working_set(p, sg_cur.ops, info_cur, sg_cur.gran);
+            int64_t ws_next = working_set(p, sg_next.ops, info_next, sg_next.gran);
+            if (ws_cur + extra_prod > p.fast_cap) continue;
+            if (ws_next + extra_cons > p.fast_cap) continue;
+            double benefit = (double)T_full / p.slow_bw * 2.0;
+            cands.push_back({t, benefit});
+        }
+
+        sort(cands.begin(), cands.end(), [](auto& a, auto& b) {
+            return a.second > b.second;
+        });
+
+        int64_t used_prod = 0, used_cons = 0;
+        int64_t avail_prod = p.fast_cap - working_set(p, sg_cur.ops, info_cur, sg_cur.gran);
+        int64_t avail_cons = p.fast_cap - working_set(p, sg_next.ops, info_next, sg_next.gran);
+        for (auto& [t, ben] : cands) {
+            int64_t T_full = p.tensors[t].w * p.tensors[t].h;
+            int64_t ep = T_full - sg_cur.gran.w * sg_cur.gran.h;
+            int64_t ec = T_full - input_slice(p, t, sg_next.ops, sg_next.gran);
+            if (used_prod + ep <= avail_prod && used_cons + ec <= avail_cons) {
+                sg_cur.retain.push_back(t);
+                used_prod += ep;
+                used_cons += ec;
+            }
+        }
+    }
+}
+
+// ============================================================
 // Solution output
 // ============================================================
 
@@ -584,11 +786,18 @@ void write_solution(const char* path, const vector<Subgraph>& sgs,
     ofstream f(path);
     if (!f) { cerr << "Cannot write " << path << endl; exit(1); }
 
+    // Build retained-in sets for each subgraph in schedule order
+    int ns = (int)order.size();
+    vector<set<int>> retained_in(ns);
+    for (int i = 0; i + 1 < ns; i++)
+        for (int t : sgs[order[i]].retain)
+            retained_in[i + 1].insert(t);
+
     f << "{\n";
 
     // subgraphs
     f << "  \"subgraphs\": [";
-    for (int i = 0; i < (int)order.size(); i++) {
+    for (int i = 0; i < ns; i++) {
         const auto& sg = sgs[order[i]];
         f << (i ? ", " : "") << "[";
         vector<int> sorted_ops = sg.ops;
@@ -601,33 +810,48 @@ void write_solution(const char* path, const vector<Subgraph>& sgs,
 
     // granularities
     f << "  \"granularities\": [";
-    for (int i = 0; i < (int)order.size(); i++) {
+    for (int i = 0; i < ns; i++) {
         const auto& sg = sgs[order[i]];
         f << (i ? ", " : "") << "[" << sg.gran.w << ", " << sg.gran.h << ", " << sg.gran.k << "]";
     }
     f << "],\n";
 
-    // tensors_to_retain (empty for now — teammate adds retention)
+    // tensors_to_retain
     f << "  \"tensors_to_retain\": [";
-    for (int i = 0; i < (int)order.size(); i++)
-        f << (i ? ", " : "") << "[]";
-    f << "],\n";
-
-    // traversal_orders (null for now — teammate adds traversal opt)
-    f << "  \"traversal_orders\": [";
-    for (int i = 0; i < (int)order.size(); i++)
-        f << (i ? ", " : "") << "null";
-    f << "],\n";
-
-    // subgraph_latencies
-    f << "  \"subgraph_latencies\": [";
-    for (int i = 0; i < (int)order.size(); i++) {
+    for (int i = 0; i < ns; i++) {
         const auto& sg = sgs[order[i]];
-        f << (i ? ", " : "");
-        // Recompute final latency for accuracy
+        f << (i ? ", " : "") << "[";
+        for (int j = 0; j < (int)sg.retain.size(); j++)
+            f << (j ? ", " : "") << sg.retain[j];
+        f << "]";
+    }
+    f << "],\n";
+
+    // traversal_orders
+    f << "  \"traversal_orders\": [";
+    for (int i = 0; i < ns; i++) {
+        const auto& sg = sgs[order[i]];
+        if (sg.traversal.empty()) {
+            f << (i ? ", " : "") << "null";
+        } else {
+            f << (i ? ", " : "") << "[";
+            for (int j = 0; j < (int)sg.traversal.size(); j++)
+                f << (j ? ", " : "") << sg.traversal[j];
+            f << "]";
+        }
+    }
+    f << "],\n";
+
+    // subgraph_latencies — computed with zig-zag + retention
+    f << "  \"subgraph_latencies\": [";
+    for (int i = 0; i < ns; i++) {
+        const auto& sg = sgs[order[i]];
         SGInfo info = analyze(p, sg.ops);
-        double lat = calc_latency(p, sg.ops, info, sg.gran);
-        f << lat;
+        set<int> r_out(sg.retain.begin(), sg.retain.end());
+        bool zz = !sg.traversal.empty();
+        double lat = calc_latency_final(p, sg.ops, info, sg.gran,
+                                        zz, retained_in[i], r_out);
+        f << (i ? ", " : "") << lat;
     }
     f << "]\n";
 
@@ -652,21 +876,40 @@ int main(int argc, char** argv) {
 
     // Run greedy fusion
     vector<Subgraph> sgs = greedy_fusion(p);
+    cerr << "Fusion: " << sgs.size() << " subgraphs" << endl;
 
-    cerr << "Fusion result: " << sgs.size() << " subgraphs" << endl;
+    // Topological ordering
+    auto order = topo_sort_subgraphs(sgs, p);
+
+    // Assign zig-zag traversal for MatMul subgraphs
+    assign_traversals(sgs, p);
+
+    // Assign retention between consecutive subgraphs
+    assign_retention(sgs, order, p);
+
+    // Compute final latencies and print summary
+    int ns = (int)order.size();
+    vector<set<int>> retained_in(ns);
+    for (int i = 0; i + 1 < ns; i++)
+        for (int t : sgs[order[i]].retain)
+            retained_in[i + 1].insert(t);
+
     double total = 0;
-    for (auto& sg : sgs) {
-        total += sg.latency;
-        cerr << "  SG [";
-        for (int i = 0; i < (int)sg.ops.size(); i++)
-            cerr << (i ? "," : "") << sg.ops[i];
-        cerr << "] gran=[" << sg.gran.w << "," << sg.gran.h << "," << sg.gran.k
-             << "] lat=" << sg.latency << endl;
+    for (int i = 0; i < ns; i++) {
+        auto& sg = sgs[order[i]];
+        SGInfo info = analyze(p, sg.ops);
+        set<int> r_out(sg.retain.begin(), sg.retain.end());
+        bool zz = !sg.traversal.empty();
+        double lat = calc_latency_final(p, sg.ops, info, sg.gran,
+                                        zz, retained_in[i], r_out);
+        total += lat;
+        cerr << "  SG[" << i << "] ops=" << sg.ops.size()
+             << " gran=[" << sg.gran.w << "," << sg.gran.h << "," << sg.gran.k << "]"
+             << (zz ? " zigzag" : "")
+             << " retain=" << sg.retain.size()
+             << " lat=" << lat << endl;
     }
     cerr << "Total latency: " << total << endl;
-
-    // Topological ordering for output
-    auto order = topo_sort_subgraphs(sgs, p);
 
     write_solution(argv[2], sgs, order, p);
     cerr << "Solution written to " << argv[2] << endl;
